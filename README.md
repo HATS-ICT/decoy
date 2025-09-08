@@ -2,6 +2,8 @@
 
 🎯 **A high-fidelity CS:GO simulation environment for strategic multi-agent planning research.** DECOY transforms complex 3D tactical gameplay into efficient discretized simulations while preserving environmental realism. Using neural models trained on real tournament data, it enables researchers to study strategic decision-making without the computational overhead of low-level game mechanics. Perfect for advancing multi-agent AI research in competitive scenarios.
 
+![DECOY Framework](framework_diagram.jpg)
+
 ## Quick Start
 
 ```bash
