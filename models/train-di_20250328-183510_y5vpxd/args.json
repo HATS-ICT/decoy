@@ -1,0 +1,16 @@
+{
+    "learning_rate": 0.0003,
+    "hidden_dim": 256,
+    "batch_size": 256,
+    "train_split": 0.8,
+    "num_epoch": 20,
+    "use_wandb": false,
+    "log_interval": 10,
+    "num_workers": 8,
+    "seed": 42,
+    "dropout": 0.3,
+    "use_xavier_init": true,
+    "use_batchnorm": true,
+    "gradient_clipping": 1.0,
+    "use_gradient_clipping": false
+}

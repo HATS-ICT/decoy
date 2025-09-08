@@ -1,0 +1,11 @@
+panda3d==1.10.15
+networkx
+pettingzoo
+tqdm
+pandas
+scipy
+matplotlib
+dtaidistance
+torch
+plotly
+gdown
