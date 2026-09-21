@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from dataset import DamageOutcomeDataset, collate_fn
+from .dataset import DamageOutcomeDataset, collate_fn
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from tqdm import tqdm
 import os
 import argparse
-from utils import create_run_dir, calculate_regression_metrics, plot_regression_scatter, plot_damage_distribution_matrix
+from .utils import create_run_dir, calculate_regression_metrics, plot_regression_scatter, plot_damage_distribution_matrix
 import matplotlib.pyplot as plt
 import wandb
 

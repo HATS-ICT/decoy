@@ -12,7 +12,7 @@ from tqdm import tqdm
 import time
 import joblib
 import argparse
-from dataset import DamageOutcomeDataset, MAP_NAMES, WEAPON_NAMES
+from .dataset import DamageOutcomeDataset, MAP_NAMES, WEAPON_NAMES
 import random
 from sklearn.mixture import GaussianMixture
 

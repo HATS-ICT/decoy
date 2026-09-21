@@ -6,6 +6,7 @@ import uuid
 from typing import Optional, Dict, Any, Literal, List
 
 import numpy as np
+import torch
 from panda3d.core import loadPrcFileData, Vec3, DirectionalLight, AmbientLight, LineSegs
 from panda3d.bullet import BulletWorld, BulletRigidBodyNode, BulletTriangleMeshShape, BulletTriangleMesh
 from direct.showbase.ShowBase import ShowBase
@@ -13,15 +14,16 @@ from direct.showbase.ShowBase import ShowBase
 from .config import *
 from .agent import Agent
 from .waypoints import WaypointGraph
-from .utils import Direction, Team, BombStatus, WinReason, vec_distance
+from .utils import Direction, Team, BombStatus, WinReason, vec_distance, get_opposite_team
 from .debug import DebugManager
 from .camera import SpectatorCamera
 from .damage_model import DamageEstimateModel
+from .rewards import RewardConfig, DEFAULT_REWARD_CONFIG
 
 class GameStateLogger:
     
     """Tracks the history of game states throughout a round."""
-    def __init__(self, round_id: int):
+    def __init__(self, round_id: int, agent_ids: Optional[List[str]] = None):
         self.round_id = round_id
         self.agent_hp_trajectories = defaultdict(list)
         self.agent_position_trajectories = defaultdict(list)
@@ -31,8 +33,13 @@ class GameStateLogger:
         self.winning_reason = None
         self.agent_sequence_lengths = defaultdict(int)
         
-        # Store agent IDs in a consistent order
-        self.agent_ids = [f"T_{i}" for i in range(5)] + [f"CT_{i}" for i in range(5)]
+        # Store agent IDs in a consistent order. This used to be hardcoded to a
+        # 5v5 roster, which silently fabricated rows for the absent agents (and
+        # padded them from index -1) whenever the environment ran with a
+        # different team size.
+        if agent_ids is None:
+            agent_ids = [f"T_{i}" for i in range(5)] + [f"CT_{i}" for i in range(5)]
+        self.agent_ids = list(agent_ids)
 
     def update(self, agents: Dict[str, Agent], bomb_position: Vec3, bomb_status: BombStatus):
         """Update all trajectories with current game state."""
@@ -58,28 +65,36 @@ class GameStateLogger:
 
     def export_to_file(self, filepath: str):
         """Export the game log to a .npz file."""
+        num_agents = len(self.agent_ids)
+        recorded = [self.agent_position_trajectories.get(a, []) for a in self.agent_ids]
+        max_len = max((len(t) for t in recorded), default=0)
+        if max_len == 0:
+            raise ValueError(f"Refusing to export round {self.round_id}: no states were recorded")
+
         # Convert position trajectories to numpy array (num_agents, seq_len, 3)
-        max_len = max(len(traj) for traj in self.agent_position_trajectories.values())
-        player_trajectory = np.zeros((10, max_len, 3))
-        
+        player_trajectory = np.zeros((num_agents, max_len, 3))
         for idx, agent_id in enumerate(self.agent_ids):
-            traj = self.agent_position_trajectories[agent_id]
+            traj = self.agent_position_trajectories.get(agent_id, [])
+            if not traj:
+                continue
             player_trajectory[idx, :len(traj)] = np.array(traj)
             # Pad remaining timesteps with last position
             if len(traj) < max_len:
                 player_trajectory[idx, len(traj):] = player_trajectory[idx, len(traj)-1]
 
         # Convert HP trajectories to numpy array (num_agents, seq_len)
-        player_hp_timeseries = np.zeros((10, max_len))
+        player_hp_timeseries = np.zeros((num_agents, max_len))
         for idx, agent_id in enumerate(self.agent_ids):
-            traj = self.agent_hp_trajectories[agent_id]
+            traj = self.agent_hp_trajectories.get(agent_id, [])
+            if not traj:
+                continue
             player_hp_timeseries[idx, :len(traj)] = np.array(traj)
             # Pad remaining timesteps with last HP
             if len(traj) < max_len:
                 player_hp_timeseries[idx, len(traj):] = player_hp_timeseries[idx, len(traj)-1]
 
         # Convert sequence lengths to numpy array
-        player_seq_len = np.zeros(10, dtype=np.int32)
+        player_seq_len = np.zeros(num_agents, dtype=np.int32)
         for idx, agent_id in enumerate(self.agent_ids):
             player_seq_len[idx] = self.agent_sequence_lengths.get(agent_id, 0)
 
@@ -105,12 +120,21 @@ class CSGOEngine(ShowBase):
                  debug_mode: bool = False,
                  show_waypoints: bool = False,
                  show_minimap: bool = False,
-                 waypoint_data_path: Optional[str] = None):
+                 waypoint_data_path: Optional[str] = None,
+                 reward_config: Optional[RewardConfig] = None,
+                 seed: Optional[int] = None):
+        self._assert_no_live_engine()
         self._init_panda3d_settings(render_mode)
         super().__init__()
         
         # Core settings
         self.num_team_agents = num_team_agents
+        self.reward_config = reward_config if reward_config is not None else DEFAULT_REWARD_CONFIG
+        # Dedicated RNG streams so seeding an environment cannot be perturbed by,
+        # or perturb, anything else using the global `random` / numpy state.
+        self.rng = random.Random()
+        self.np_rng = np.random.default_rng()
+        self.seed(seed)
         self.render_mode = render_mode
         self.debug_mode = debug_mode and render_mode is not None
         self.show_waypoints = show_waypoints and render_mode is not None
@@ -122,7 +146,7 @@ class CSGOEngine(ShowBase):
         
         # Initialize simulation state
         self._init_game_state()
-        self.logger = GameStateLogger(self.round_id)
+        self.logger = GameStateLogger(self.round_id, self.expected_agent_ids)
         
         # Initialize core components
         # Create debug manager if any visual debug feature is enabled
@@ -142,6 +166,28 @@ class CSGOEngine(ShowBase):
             self._init_camera()
 
 
+    @staticmethod
+    def _assert_no_live_engine() -> None:
+        """Fail early and legibly if an engine is already live in this process.
+
+        CSGOEngine subclasses Panda3D's ShowBase, and Panda3D permits exactly
+        one per process. Constructing a second raises a bare "Attempt to spawn
+        multiple ShowBase instances!" from deep inside Panda3D, which is hard to
+        connect back to the cause.
+
+        Practical consequence: environments cannot be vectorised in-process.
+        Run each one in its own subprocess, or close() the current environment
+        before constructing the next.
+        """
+        import builtins
+        if hasattr(builtins, "base"):
+            raise RuntimeError(
+                "A CSGOEngine is already running in this process. Panda3D allows "
+                "only one ShowBase instance, so environments cannot coexist. "
+                "Either call close() on the existing environment first, or run "
+                "each environment in its own subprocess (see marl/vec_env.py)."
+            )
+
     def _init_panda3d_settings(self, render_mode: Optional[str]) -> None:
         """Initialize Panda3D specific settings."""
         loadPrcFileData('', 'bullet-filter-algorithm groups-mask')
@@ -151,6 +197,23 @@ class CSGOEngine(ShowBase):
         if render_mode is None:
             loadPrcFileData('', 'window-type none')
             loadPrcFileData('', 'audio-library-name null')
+
+    @property
+    def expected_agent_ids(self) -> List[str]:
+        """Canonical agent ordering for this roster size."""
+        return ([f"T_{i}" for i in range(self.num_team_agents)]
+                + [f"CT_{i}" for i in range(self.num_team_agents)])
+
+    def seed(self, seed: Optional[int] = None) -> None:
+        """Reseed every stochastic component the simulation draws from.
+
+        Covers spawn selection, bomb-carrier assignment and the torch generator
+        used by the damage VAE, so a given seed reproduces a round exactly.
+        """
+        self.rng.seed(seed)
+        self.np_rng = np.random.default_rng(seed)
+        if seed is not None:
+            torch.manual_seed(seed)
 
     def _init_game_state(self) -> None:
         """Initialize simulation state variables."""
@@ -177,14 +240,20 @@ class CSGOEngine(ShowBase):
         self.winning_reason = None
         self.game_time_limit = GAME_TIME_LIMIT
         self.game_timeout_flag = False
+        # check_winning_team() runs every tick; this latch keeps the terminal
+        # reward from being granted more than once per round.
+        self._terminal_reward_granted = False
 
     def _init_map(self):
         """Initialize the map model and its properties."""
         try:
-            self.map = self.loader.loadModel(MAP_PATH, noCache=NO_MODEL_CACHE)
+            self.map = self.loader.loadModel(panda_path(MAP_PATH), noCache=NO_MODEL_CACHE)
         except Exception as e:
-            print(f"Error loading FBX map: {e}")
-            sys.exit(1)
+            raise FileNotFoundError(
+                f"Could not load the map model at {MAP_PATH}: {e}\n"
+                "The decompiled map is not tracked in git. Fetch it with:\n"
+                "    python download_decompiled_map.py"
+            ) from e
         
         self.map.reparentTo(self.render)
         self.map.set_pos(MAP_POSITION)
@@ -311,8 +380,11 @@ class CSGOEngine(ShowBase):
             return self.agents[self.bomb_carrier].position
     
     def update_simulation(self):
-        """Update the simulation state by advancing physics and handling agent updates.
-        Continues updating until an agent requests a decision."""
+        """Advance physics until an agent requests a decision, or the round ends."""
+        if self.game_ended:
+            # Re-entering after the round is decided would re-append every
+            # surviving agent to the termination queue on each tick.
+            return
         while not self.agent_action_request_queue:
             # Update time tracking
             realtime = self.clock.getRealTime()
@@ -417,28 +489,91 @@ class CSGOEngine(ShowBase):
                 self.bomb_status = BombStatus.Detonated
             self.game_timeout_flag = True
 
+    def add_reward(self, agent_id: str, amount: float, share_with_team: bool = True) -> None:
+        """Credit ``amount`` to ``agent_id``, optionally sharing with teammates.
+
+        Rewards accumulate on the agent until the environment drains them in
+        ``step()``; that is what makes the AEC reward semantics ("reward earned
+        since this agent last acted") come out right.
+        """
+        if amount == 0.0:
+            return
+        self.agents[agent_id].pending_reward += amount
+
+        spirit = self.reward_config.team_spirit
+        if share_with_team and spirit > 0.0:
+            team = self.agents[agent_id].team
+            for teammate in self.agents_by_team[team]:
+                if teammate.agent_id != agent_id:
+                    teammate.pending_reward += amount * spirit
+
+    def add_team_reward(self, team: Team, amount: float) -> None:
+        """Credit ``amount`` to every agent on ``team``, alive or dead."""
+        if amount == 0.0:
+            return
+        for agent in self.agents_by_team[team]:
+            agent.pending_reward += amount
+
+    def collect_rewards(self) -> Dict[str, float]:
+        """Drain and return the reward each agent accrued since the last call."""
+        drained = {}
+        for agent_id, agent in self.agents.items():
+            drained[agent_id] = agent.pending_reward
+            agent.pending_reward = 0.0
+        return drained
+
     def estimate_damage_outcomes(self):
         """Estimate the damage outcomes for all alive agents."""
         # Get all alive agents from both teams
         alive_t_agents = self.alive_t_agents
         alive_ct_agents = self.alive_ct_agents
         
-        # Check damage between pairs of agents both ways
+        # Line of sight is symmetric, so it is tested once per unordered pair
+        # rather than once per ordered pair; both firing directions are then
+        # resolved from that single ray test.
+        engagements = []
         for t_agent in alive_t_agents:
             for ct_agent in alive_ct_agents:
                 if t_agent.has_line_of_sight_to_agent(ct_agent):
-                    self.estimate_damage(attacker=t_agent, victim=ct_agent)
-                if ct_agent.has_line_of_sight_to_agent(t_agent):
-                    self.estimate_damage(attacker=ct_agent, victim=t_agent)
+                    engagements.append((t_agent, ct_agent))
+                    engagements.append((ct_agent, t_agent))
 
-    def estimate_damage(self, attacker, victim):
-        """Estimate the damage outcome for a given attacker and victim."""
-        will_damage, damage_amount, hit_group = self.damage_model.predict_damage(attacker.position, victim.position, attacker.view_angle, victim.view_angle, attacker.health, attacker.weapon.value, victim.has_armor, victim.has_helmet)
-        if will_damage:
-            victim.health -= damage_amount
-            attacker.draw_shooting_line(victim)
-            # print(f"Damage estimated: {damage_amount} to {victim.agent_id} from {attacker.agent_id}")
-        return 
+        if engagements:
+            self.resolve_engagements(engagements)
+
+    def resolve_engagements(self, engagements):
+        """Resolve every (attacker, victim) pair with a single batched model call."""
+        outcomes = self.damage_model.predict_damage_batch([
+            dict(attacker_pos=a.position, victim_pos=v.position,
+                 attacker_angle=a.view_angle, victim_angle=v.view_angle,
+                 attacker_hp=a.health, attacker_weapon_id=a.weapon.value,
+                 victim_has_armor=v.has_armor, victim_has_helmet=v.has_helmet)
+            for a, v in engagements
+        ])
+
+        for (attacker, victim), (will_damage, damage_amount, _hit_group) in zip(engagements, outcomes):
+            if will_damage:
+                self.apply_damage(attacker, victim, damage_amount)
+
+    def apply_damage(self, attacker, victim, damage_amount: float) -> None:
+        """Apply damage, record attribution, and credit the shaping rewards.
+
+        Attribution matters: without recording who landed the blow there is no
+        way to credit the kill when the victim's health later reaches zero.
+        """
+        # Only damage that lands on a living agent counts, so overkill past
+        # 0 HP is not rewarded.
+        effective = min(damage_amount, max(victim.health, 0.0))
+        victim.health -= damage_amount
+        victim.last_attacker_id = attacker.agent_id
+
+        cfg = self.reward_config
+        self.add_reward(attacker.agent_id, cfg.damage_dealt * effective)
+        self.add_reward(victim.agent_id, cfg.damage_taken * effective)
+
+        attacker.stats.damage_dealt += effective
+        victim.stats.damage_taken += effective
+        attacker.draw_shooting_line(victim)
 
     def check_winning_team(self):
         """Check if the game has ended. return winning team and reason"""
@@ -454,6 +589,11 @@ class CSGOEngine(ShowBase):
             self.winning_team, self.winning_reason = Team.CT, WinReason.TimeOut
         else:
             self.winning_team, self.winning_reason = None, None
+
+        if self.winning_team is not None and not self._terminal_reward_granted:
+            self._terminal_reward_granted = True
+            self.add_team_reward(self.winning_team, self.reward_config.win)
+            self.add_team_reward(get_opposite_team(self.winning_team), self.reward_config.lose)
         # if self.winning_team is not None:
         #     print(f"Game ended. Winning team: {self.winning_team}, Reason: {self.winning_reason}")
 
@@ -508,7 +648,9 @@ class CSGOEngine(ShowBase):
         """
         if self.termination_queue:
             return self.termination_queue.popleft()
-        return self.agent_action_request_queue.popleft()
+        if self.agent_action_request_queue:
+            return self.agent_action_request_queue.popleft()
+        return None
     
     def get_random_agent(self, team: Team, alive_only: bool = True, return_id: bool = True):
         """Get a random agent from the given team."""
@@ -516,40 +658,34 @@ class CSGOEngine(ShowBase):
         if alive_only:
             agents = [agent for agent in agents if agent.is_alive]
         if return_id:
-            return random.choice(agents).agent_id
+            return self.rng.choice(agents).agent_id
         else:
-            return random.choice(agents)
+            return self.rng.choice(agents)
 
     def agent_decision_request_check(self):
         """Check if an agent has requested a decision."""
         has_decision_request = False
-        for agent_id in self.alive_agents:
+        for agent_id in list(self.alive_agents):
             if self.agents[agent_id].has_decision_request():
                 self.agent_action_request_queue.append(agent_id)
                 self.total_agent_decision_requests += 1
+                self.add_reward(agent_id, self.reward_config.time_penalty, share_with_team=False)
                 has_decision_request = True
         return has_decision_request
     
-    def plant_bomb(self, plant_waypoint_id):
+    def plant_bomb(self, plant_waypoint_id, planter_id: Optional[str] = None):
         self.bomb_world_position = self.waypoints.get_waypoint_by_id(plant_waypoint_id, return_pos=True)
         self.bomb_status = BombStatus.Planted
         self.bomb_carrier = None
         self.game_time_limit = self.game_time + GAME_TIME_BOMB_EXTENSION
+        if planter_id is not None:
+            self.add_reward(planter_id, self.reward_config.bomb_plant)
 
-    def defuse_bomb(self):
+    def defuse_bomb(self, defuser_id: Optional[str] = None):
         self.bomb_status = BombStatus.Defused
+        if defuser_id is not None:
+            self.add_reward(defuser_id, self.reward_config.bomb_defuse)
 
-    def estimate_hit_damage(self, attacker, victim):
-        DISTANCE_MEAN = 705.522216796875
-        DISTANCE_STD = 383.8244934082031
-        weapon = attacker.weapon
-        distance = vec_distance(attacker.position, victim.position) * COORDINATE_SCALE
-        distance = (distance - DISTANCE_MEAN) / DISTANCE_STD
-        has_armor = victim.has_armor
-        has_helmet = victim.has_helmet
-        damage = self.damage_model.predict_damage(weapon, distance, has_armor, has_helmet)
-        return damage
-    
     def set_agent_hp(self, agent_id, hp):
         self.agents[agent_id].health = hp
 
@@ -557,7 +693,7 @@ class CSGOEngine(ShowBase):
         """Reset the game engine."""
         options = options or {}
         self.round_id = options.get("round_id", uuid.uuid4()) 
-        self.logger = GameStateLogger(self.round_id)
+        self.logger = GameStateLogger(self.round_id, self.expected_agent_ids)
         self.simulation_paused = False
         self.single_step_requested = False
         self.physics_time_buffer = 0.0
@@ -575,6 +711,8 @@ class CSGOEngine(ShowBase):
         self.winning_team = None
         self.winning_reason = None
         self.game_timeout_flag = False
+        self._terminal_reward_granted = False
+        self.game_time_limit = GAME_TIME_LIMIT
         if self.debug_manager:
             self.debug_manager.reset()
         
@@ -619,9 +757,3 @@ class CSGOEngine(ShowBase):
 
         if self.enable_logging:
             self.logger.update(self.agents, self.current_bomb_position, self.bomb_status)
-
-
-if __name__ == "__main__":
-    game = CSGOEngine()
-    while True:
-        game.step()

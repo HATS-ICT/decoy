@@ -4,12 +4,12 @@ from tqdm import tqdm
 import multiprocessing as mp
 import pandas as pd
 from functools import partial
-from utils import transform_csgo_to_panda3d
+from env.utils import transform_csgo_to_panda3d
 
 def process_trajectory(args):
     """Process a single trajectory for all players and metrics"""
-    from utils import transform_csgo_to_panda3d
-    from evaluation import (procrustes_disparity, dtw_distance_normalized, 
+    from env.utils import transform_csgo_to_panda3d
+    from analysis.evaluation import (procrustes_disparity, dtw_distance_normalized, 
                           euclidean_distance_normalized, rmse, frechet_distance,
                           interpolate_trajectory)
     

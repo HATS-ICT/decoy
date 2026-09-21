@@ -1,10 +1,10 @@
-from game_engine import CSGOEngine
-from utils import Direction
+from env.game_engine import CSGOEngine
+from env.utils import Direction
 import networkx as nx
 from typing import Set, Tuple
 from panda3d.core import LineSegs
 from tqdm import tqdm
-from config import PHYSICS_STEP
+from env.config import PHYSICS_STEP
 
 class WaypointVerifier:
     def __init__(self, render_mode=None, waypoint_data_path=None):

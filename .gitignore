@@ -115,3 +115,6 @@ celerybeat.pid
 Thumbs.db
 
 *.fbx
+# DECOY: training runs and MARL checkpoints
+runs/
+marl_runs/

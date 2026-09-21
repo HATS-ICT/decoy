@@ -1,11 +1,36 @@
+# Runtime dependencies for the DECOY simulation environment.
+#
+# Prefer `pip install -e .` (see pyproject.toml), which also installs the
+# packages as importable modules. This file is the flat equivalent, plus the
+# extras needed to run everything in the repository.
+#
+# NOTE on torch: versions 2.12-2.14 failed to load their DLLs during setup on
+# Windows (OSError WinError 1114 on c10.dll). 2.11 is the last version verified
+# here. Panda3D must also be imported *after* torch; `import env` handles that.
+
+# --- environment ---
 panda3d==1.10.15
-networkx
-pettingzoo
-tqdm
-pandas
-scipy
-matplotlib
-dtaidistance
-torch
-plotly
-gdown
+torch>=2.0,<2.12
+numpy>=1.24
+scipy>=1.10
+networkx>=3.0
+pettingzoo>=1.24
+gymnasium>=0.29
+tqdm>=4.65
+
+# --- damage-model training (trainer/) ---
+pandas>=2.0
+matplotlib>=3.7
+scikit-learn>=1.3
+joblib>=1.3
+seaborn>=0.13
+wandb>=0.16
+
+# --- offline analysis (analysis/, notebook/) ---
+plotly>=5.18
+
+# --- asset download (download_decompiled_map.py) ---
+gdown>=5.0
+
+# --- tests ---
+pytest>=7.4

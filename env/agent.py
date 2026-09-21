@@ -31,7 +31,9 @@ class Agent:
         self.grenade = 1
         self.stats: AgentStats = AgentStats()
         self.waypoint_path: List[int] = []
-        self.view_angle: Optional[Vec3] = 90
+        # Yaw in degrees, fed to the damage model. Historically pinned at a
+        # constant 90 for every agent; see the `view_angle` property.
+        self._view_angle: float = 90.0
 
         # Movement State
         self.movement_speed: float = AGENT_MOVEMENT_SPEED
@@ -45,7 +47,12 @@ class Agent:
         self.is_stopping: bool = False
         self.stopping_tick: Optional[int] = 0
         self.prev_decision_tick: Optional[int] = None
-        self.current_reward: float = 0
+        # Reward accrued since the environment last drained it. Previously this
+        # was `current_reward`, which was initialised to 0 and never written, so
+        # every agent reported a reward of exactly 0 for the whole episode.
+        self.pending_reward: float = 0.0
+        # Who last damaged this agent, so a kill can be credited on death.
+        self.last_attacker_id: Optional[str] = None
         self.death_position: Optional[np.ndarray] = None
 
         self._setup_agent_model()
@@ -113,17 +120,47 @@ class Agent:
                          ], dtype=np.float32)
 
     @property
+    def view_angle(self) -> float:
+        """Horizontal view angle (yaw, degrees) handed to the damage model.
+
+        The original implementation pinned this at a constant 90 for every
+        agent for the whole episode, which means the damage model's
+        relative-angle feature carried no information about where anyone was
+        actually facing. Setting ``AGENT_VIEW_ANGLE_FOLLOWS_MOVEMENT`` makes the
+        agent face along its current movement heading instead.
+
+        This defaults to ``False`` because switching it on changes the
+        simulation's damage dynamics, and the published results were produced
+        with the constant.
+        """
+        if not AGENT_VIEW_ANGLE_FOLLOWS_MOVEMENT:
+            return self._view_angle
+        if self.target_pos is None:
+            return self._view_angle
+        heading = self.target_pos - self.position
+        if heading.x == 0 and heading.y == 0:
+            return self._view_angle
+        return float(math.degrees(math.atan2(heading.y, heading.x)))
+
+    @property
     def action_mask(self):
+        """Which of the 9 actions are legal from the current waypoint.
+
+        Returned as ``int8`` rather than ``bool`` because that is what
+        ``gymnasium.spaces.Discrete.sample(mask=...)`` requires, and therefore
+        what the PettingZoo API test and most masked-action learners expect.
+        """
         action_mask = [0] * 8
         for direction in Direction:
             if self.engine.waypoints.is_neighbor_valid(self.current_waypoint["id"], direction):
                 action_mask[direction.value] = 1
-        action_mask += [1] # stoping is always valid
-        return np.array(action_mask, dtype=bool)
+        action_mask += [1]  # stopping is always valid
+        return np.array(action_mask, dtype=np.int8)
 
     @property
     def reward(self):
-        return self.current_reward
+        """Reward accrued since the environment last drained it."""
+        return self.pending_reward
     
     @property
     def termination(self):
@@ -140,7 +177,8 @@ class Agent:
         self.stopping_tick = 0
         self.grenade = 1
         self.movement_speed = AGENT_MOVEMENT_SPEED
-        self.current_reward = 0
+        self.pending_reward = 0.0
+        self.last_attacker_id = None
         self.prev_position = None
         self.prev_decision_tick = None
         self.current_direction = None
@@ -168,6 +206,12 @@ class Agent:
 
     def handle_death(self):
         if self.health <= 0:
+            cfg = self.engine.reward_config
+            self.engine.add_reward(self.agent_id, cfg.death, share_with_team=False)
+            if self.last_attacker_id is not None:
+                self.engine.add_reward(self.last_attacker_id, cfg.kill)
+                self.engine.agents[self.last_attacker_id].stats.kills += 1
+            self.stats.deaths += 1
             self.die()
             self.engine.termination_queue.append(self.agent_id)
 
@@ -177,9 +221,9 @@ class Agent:
         
         if self.is_t and self.has_bomb and self.is_at_bomb_site:
             plant_waypoint_id = self.current_waypoint['id']
-            self.engine.plant_bomb(plant_waypoint_id)
+            self.engine.plant_bomb(plant_waypoint_id, planter_id=self.agent_id)
         elif self.is_ct and self.is_near_bomb and self.engine.bomb_has_planted:
-            self.engine.defuse_bomb()
+            self.engine.defuse_bomb(defuser_id=self.agent_id)
 
     def die(self):
         """When an agent dies, it's class stays to keep the stats going but its models are removed to protect other game logic"""
@@ -194,21 +238,29 @@ class Agent:
             self.engine.bomb_world_position = self.current_waypoint['pos']
 
     def reset_agent_position(self):
+        """Place the agent at its spawn and bind it to the nearest waypoint.
+
+        Spawning at a fixed ``init_pos`` used to raise ``UnboundLocalError``:
+        that branch never bound ``reset_waypoint``, which the final line needs.
+        The agent's graph position is now resolved from the spawn coordinate.
+        """
+        rng = self.engine.rng
         if self.spawn_mode == "random":
-            reset_waypoint = self.engine.waypoints.get_random_waypoint()
+            reset_waypoint = self.engine.waypoints.get_random_waypoint(rng=rng)
         elif self.spawn_mode == "random_spawn":
-            if self.is_t:
-                reset_waypoint = self.engine.waypoints.get_random_waypoint_in_region(Region.T_SPAWN)
-            elif self.is_ct:
-                reset_waypoint = self.engine.waypoints.get_random_waypoint_in_region(Region.CT_SPAWN)
+            region = Region.T_SPAWN if self.is_t else Region.CT_SPAWN
+            reset_waypoint = self.engine.waypoints.get_random_waypoint_in_region(region, rng=rng)
         elif self.spawn_mode == "fixed":
             if self.init_pos is not None:
-                reset_pos = self.init_pos
+                # An explicit world position still needs a graph anchor, since
+                # movement and the action mask are defined over waypoints.
+                reset_waypoint = self.engine.waypoints.get_nearest_waypoint(Vec3(*self.init_pos))
             else:
                 reset_waypoint = self.engine.waypoints.get_waypoint_by_id(self.init_waypoint_id)
         else:
             raise ValueError(f"Invalid spawn mode: {self.spawn_mode}")
-        reset_pos = reset_waypoint['pos'] if self.init_pos is None else self.init_pos
+
+        reset_pos = Vec3(*self.init_pos) if self.init_pos is not None else reset_waypoint['pos']
         reset_pos = reset_pos + Vec3(0, 0, INITIAL_HEIGHT_OFFSET)
         self.node_path.setPos(reset_pos)
         self.current_waypoint = reset_waypoint
@@ -332,7 +384,7 @@ class Agent:
     
     def _setup_agent_model(self):
         """Setup the agent's hitbox and character controller."""
-        self.model = self.engine.loader.loadModel(AGENT_MODEL_PATH, noCache=NO_MODEL_CACHE)
+        self.model = self.engine.loader.loadModel(panda_path(AGENT_MODEL_PATH), noCache=NO_MODEL_CACHE)
         self.model.setScale(AGENT_SCALE)
         if self.is_t:
             self.model.setColorScale(*TERRORIST_COLOR)

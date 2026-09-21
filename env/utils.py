@@ -11,6 +11,10 @@ class AgentStats:
         self.total_jumps: int = 0
         self.total_reward: float = 0.0
         self.stuck_count: int = 0
+        self.kills: int = 0
+        self.deaths: int = 0
+        self.damage_dealt: float = 0.0
+        self.damage_taken: float = 0.0
         self.decision_ticks: List[Tuple[Direction, int]] = []
 
     @property
@@ -27,14 +31,20 @@ class AgentStats:
     
     @property
     def avg_decision_tick(self):
+        if not self.total_decisions:
+            return 0.0
         return sum(tick for _, tick in self.decision_ticks) / self.total_decisions
     
     @property
     def avg_decision_tick_cardinal(self):
+        if not self.total_cardinal_decisions:
+            return 0.0
         return sum(tick for direction, tick in self.decision_ticks if direction in [Direction.N, Direction.E, Direction.S, Direction.W]) / self.total_cardinal_decisions
     
     @property
     def avg_decision_tick_diagonal(self):
+        if not self.total_diagonal_decisions:
+            return 0.0
         return sum(tick for direction, tick in self.decision_ticks if direction in [Direction.NE, Direction.NW, Direction.SE, Direction.SW]) / self.total_diagonal_decisions
 
     @property
@@ -67,6 +77,10 @@ class AgentStats:
         self.total_jumps = 0
         self.total_reward = 0.0
         self.stuck_count = 0
+        self.kills = 0
+        self.deaths = 0
+        self.damage_dealt = 0.0
+        self.damage_taken = 0.0
         self.decision_ticks = []
 
     def to_dict(self) -> Dict[str, float]:
@@ -76,7 +90,11 @@ class AgentStats:
             "total_diagonal_decisions": self.total_diagonal_decisions,
             "total_jumps": self.total_jumps,
             "total_reward": self.total_reward,
-            "stuck_count": self.stuck_count
+            "stuck_count": self.stuck_count,
+            "kills": self.kills,
+            "deaths": self.deaths,
+            "damage_dealt": self.damage_dealt,
+            "damage_taken": self.damage_taken,
         }
 
 

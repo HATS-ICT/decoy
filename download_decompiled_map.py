@@ -1,5 +1,9 @@
-import gdown
 import os
+from pathlib import Path
+
+import gdown
+
+ASSETS_DIR = Path(__file__).resolve().parent / "env" / "assets"
 
 def download_decompiled_map():
     """Download the de_dust_2.fbx file from Google Drive to env/assets/"""
@@ -7,9 +11,8 @@ def download_decompiled_map():
     
     url = f"https://drive.google.com/uc?id={file_id}"
     
-    assets_dir = os.path.join("env", "assets")
-    os.makedirs(assets_dir, exist_ok=True)
-    output_path = os.path.join(assets_dir, "de_dust_2.fbx")
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = str(ASSETS_DIR / "de_dust_2.fbx")
     
     print(f"Downloading de_dust_2.fbx to {output_path}...")
     
@@ -24,14 +27,14 @@ def download_map_if_not_exist():
     """Download the de_dust_2.fbx file only if it doesn't already exist"""
     
     # Check if file already exists
-    output_path = os.path.join("env", "assets", "de_dust_2.fbx")
+    output_path = ASSETS_DIR / "de_dust_2.fbx"
     
-    if os.path.exists(output_path):
+    if output_path.exists():
         return True
     else:
         print("de_dust_2.fbx not found, downloading...")
         download_decompiled_map()
-        return os.path.exists(output_path)
+        return output_path.exists()
 
 if __name__ == "__main__":
     download_decompiled_map()
