@@ -10,7 +10,7 @@ import os
 import argparse
 from .utils import create_run_dir, calculate_regression_metrics, plot_regression_scatter, plot_damage_distribution_matrix
 import matplotlib.pyplot as plt
-import wandb
+from ._wandb import wandb
 
 
 class DamageRegressionVAE(nn.Module):
