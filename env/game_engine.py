@@ -14,7 +14,7 @@ from direct.showbase.ShowBase import ShowBase
 from .config import *
 from .agent import Agent
 from .waypoints import WaypointGraph
-from .utils import Direction, Team, BombStatus, WinReason, vec_distance, get_opposite_team
+from .utils import Direction, Team, BombStatus, WinReason, vec_distance, get_opposite_team, Region
 from .debug import DebugManager
 from .camera import SpectatorCamera
 from .damage_model import DamageEstimateModel
@@ -243,6 +243,10 @@ class CSGOEngine(ShowBase):
         # check_winning_team() runs every tick; this latch keeps the terminal
         # reward from being granted more than once per round.
         self._terminal_reward_granted = False
+        # Objective distance fields for reward shaping. The bomb-site field is
+        # map-static and survives resets; the bomb field is rebuilt on each plant.
+        self._bombsite_field = None
+        self._bomb_field = None
 
     def _init_map(self):
         """Initialize the map model and its properties."""
@@ -277,12 +281,12 @@ class CSGOEngine(ShowBase):
         shape = BulletTriangleMeshShape(mesh, dynamic=False)
         node = BulletRigidBodyNode('MapCollision')
         node.addShape(shape)
-        # Add some friction to prevent sliding
-        np = self.render.attachNewNode(node)
-        np.setPos(self.map.getPos())
-        np.setHpr(self.map.getHpr())
-        np.setScale(self.map.getScale())
-        np.setCollideMask(COLLISION_BITMASK_ENVIRONMENT)
+        # `np` here used to shadow the numpy import for the rest of the method.
+        map_node_path = self.render.attachNewNode(node)
+        map_node_path.setPos(self.map.getPos())
+        map_node_path.setHpr(self.map.getHpr())
+        map_node_path.setScale(self.map.getScale())
+        map_node_path.setCollideMask(COLLISION_BITMASK_ENVIRONMENT)
         # node.setFriction(0.0)
         self.world.attachRigidBody(node)
 
@@ -489,6 +493,47 @@ class CSGOEngine(ShowBase):
                 self.bomb_status = BombStatus.Detonated
             self.game_timeout_flag = True
 
+    # ------------------------------------------------------------ objectives
+    @property
+    def bombsite_distance_field(self):
+        """Distance from every waypoint to the nearest bomb site, computed once."""
+        if self._bombsite_field is None:
+            sites = (self.waypoints.waypoints_in_region(Region.A_BOMBSITE)
+                     + self.waypoints.waypoints_in_region(Region.B_BOMBSITE))
+            self._bombsite_field = self.waypoints.distance_field(sites)
+        return self._bombsite_field
+
+    def objective_distance(self, agent) -> Optional[float]:
+        """Graph distance from ``agent`` to whatever it should be heading for.
+
+        Before the plant both sides converge on the bomb sites; afterwards both
+        converge on the bomb itself (CT to defuse it, T to hold it).
+        """
+        field = self._bomb_field if self.bomb_has_planted else self.bombsite_distance_field
+        if field is None:
+            return None
+        waypoint = agent.current_waypoint
+        if waypoint is None:
+            return None
+        return field.get(waypoint["id"])
+
+    def credit_objective_progress(self, agent) -> None:
+        """Reward the graph distance closed on the objective since the last decision."""
+        weight = self.reward_config.objective_progress
+        if weight == 0.0:
+            return
+
+        distance = self.objective_distance(agent)
+        if distance is None:
+            return
+
+        previous = agent.prev_objective_distance
+        agent.prev_objective_distance = distance
+        if previous is None:
+            # First decision of the round establishes the baseline only.
+            return
+        self.add_reward(agent.agent_id, weight * (previous - distance), share_with_team=False)
+
     def add_reward(self, agent_id: str, amount: float, share_with_team: bool = True) -> None:
         """Credit ``amount`` to ``agent_id``, optionally sharing with teammates.
 
@@ -670,6 +715,7 @@ class CSGOEngine(ShowBase):
                 self.agent_action_request_queue.append(agent_id)
                 self.total_agent_decision_requests += 1
                 self.add_reward(agent_id, self.reward_config.time_penalty, share_with_team=False)
+                self.credit_objective_progress(self.agents[agent_id])
                 has_decision_request = True
         return has_decision_request
     
@@ -678,6 +724,11 @@ class CSGOEngine(ShowBase):
         self.bomb_status = BombStatus.Planted
         self.bomb_carrier = None
         self.game_time_limit = self.game_time + GAME_TIME_BOMB_EXTENSION
+        if self.reward_config.objective_progress != 0.0:
+            self._bomb_field = self.waypoints.distance_field([plant_waypoint_id])
+            # The objective moved, so every agent's baseline is stale.
+            for agent in self.agents.values():
+                agent.prev_objective_distance = None
         if planter_id is not None:
             self.add_reward(planter_id, self.reward_config.bomb_plant)
 
@@ -713,6 +764,7 @@ class CSGOEngine(ShowBase):
         self.game_timeout_flag = False
         self._terminal_reward_granted = False
         self.game_time_limit = GAME_TIME_LIMIT
+        self._bomb_field = None
         if self.debug_manager:
             self.debug_manager.reset()
         

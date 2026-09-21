@@ -954,6 +954,45 @@ class WaypointGraph:
         self._kdtree_ids = ids
         self._kdtree = cKDTree(positions)
 
+    def distance_field(self, target_ids):
+        """Graph distance from every waypoint to the nearest of ``target_ids``.
+
+        Edge weights are euclidean segment lengths, so the result is true
+        traversal distance and respects walls -- unlike straight-line distance,
+        which on a map like de_dust2 points agents through geometry they cannot
+        walk through.
+
+        Implemented as one multi-source Dijkstra on the reversed graph, which
+        gives distances *to* the targets rather than *from* them. One pass over
+        the full 6.6k-node graph takes a few milliseconds, so this is cheap
+        enough to recompute whenever the objective moves.
+
+        Returns:
+            dict mapping waypoint id -> distance. Unreachable nodes are absent.
+        """
+        targets = [t for t in target_ids if t in self.graph]
+        if not targets:
+            raise ValueError("distance_field called with no valid target waypoints")
+
+        if not self.graph.has_edge(*next(iter(self.graph.edges))) or "weight" not in \
+                self.graph.edges[next(iter(self.graph.edges))]:
+            self._ensure_edge_weights()
+
+        reverse = self.graph.reverse(copy=False)
+        return nx.multi_source_dijkstra_path_length(reverse, set(targets), weight="weight")
+
+    def _ensure_edge_weights(self):
+        """Annotate every edge with its euclidean length, once."""
+        for u, v, data in self.graph.edges(data=True):
+            if "weight" not in data:
+                data["weight"] = float(vec_distance(
+                    self.graph.nodes[u]["pos"], self.graph.nodes[v]["pos"]
+                ))
+
+    def waypoints_in_region(self, region_type: Region):
+        """All waypoint ids belonging to ``region_type``."""
+        return list(self.regions[region_type])
+
     def position_bounds(self):
         """Axis-aligned bounding box over all waypoints, as (min_xyz, max_xyz)."""
         self._ensure_spatial_index()

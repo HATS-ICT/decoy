@@ -32,6 +32,13 @@ class RewardConfig:
             The rest of that agent's team receives it scaled by ``team_spirit``.
         time_penalty: small negative applied once per decision request, which
             discourages stalling without dominating the objective.
+        objective_progress: potential-based shaping, per unit of graph distance
+            closed on the current objective (a bomb site before the plant, the
+            planted bomb afterwards). Because it is the difference of a
+            potential over states, it does not change the set of optimal
+            policies (Ng, Harada & Russell, 1999) -- it only makes the gradient
+            findable. Defaults to 0; without it a random policy never reaches a
+            bomb site, so win/loss carries no signal at all and nothing learns.
         team_spirit: in ``[0, 1]``. Fraction of an individual's event reward
             that is also handed to each teammate. ``0`` is fully selfish credit
             assignment, ``1`` makes the team's reward fully shared. Terminal
@@ -47,6 +54,7 @@ class RewardConfig:
     bomb_plant: float = 0.3
     bomb_defuse: float = 0.3
     time_penalty: float = -0.001
+    objective_progress: float = 0.0
     team_spirit: float = 0.0
 
     def __post_init__(self):
@@ -59,6 +67,11 @@ class RewardConfig:
 
 #: Dense default used when the environment is constructed without an explicit config.
 DEFAULT_REWARD_CONFIG = RewardConfig()
+
+#: Dense default plus objective-distance shaping. This is what the bundled MARL
+#: baseline trains against: with the unshaped default a random policy never
+#: reaches a bomb site, so the terminal reward is constant and nothing learns.
+SHAPED_REWARD_CONFIG = RewardConfig(objective_progress=0.01)
 
 #: Pure outcome reward: no shaping, only the terminal win/loss signal. Harder to
 #: learn from, but free of the bias that shaping terms introduce.

@@ -257,7 +257,7 @@ def transform_csgo_to_panda3d(points):
 def transform_panda3d_to_csgo(points):
     return (points - np.array([0.0, 0.0, 3.1])) / COORDINATE_SCALE
 
-# def tramsform_to_minimap(points, map_size):
+# def transform_to_minimap(points, map_size):
 #     csgo_points = transform_panda3d_to_csgo(points)
 #     scale = 4.4
 #     pos_x = -2476
@@ -271,7 +271,7 @@ def transform_panda3d_to_csgo(points):
 #     return (x, y)
 
 
-def tramsform_to_minimap(points, map_size):
+def transform_to_minimap(points, map_size):
     csgo_points = transform_panda3d_to_csgo(points)
     scale = 4.4
     pos_x = -2476
@@ -283,6 +283,10 @@ def tramsform_to_minimap(points, map_size):
     x = (x / map_size) * 2 - 1
     y = (y / map_size) * 2 - 1
     return (x, -y)
+
+#: Deprecated misspelling kept so existing callers keep working.
+tramsform_to_minimap = transform_to_minimap
+
 
 def bomb_status_to_onehot(status: BombStatus) -> np.ndarray:
     """Convert BombStatus enum to one-hot encoded numpy array."""

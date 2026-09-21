@@ -1,7 +1,7 @@
 from panda3d.core import Vec3, LineSegs
 from panda3d.bullet import BulletCapsuleShape, ZUp, BulletCharacterControllerNode
 import numpy as np
-from .utils import Region, Team, vec_distance, Direction, AgentStats, get_opposite_team, bomb_status_to_onehot, BombStatus, Weapon, tramsform_to_minimap
+from .utils import Region, Team, vec_distance, Direction, AgentStats, get_opposite_team, bomb_status_to_onehot, BombStatus, Weapon, transform_to_minimap
 from .config import *
 from typing import Optional, List
 import math
@@ -53,6 +53,9 @@ class Agent:
         self.pending_reward: float = 0.0
         # Who last damaged this agent, so a kill can be credited on death.
         self.last_attacker_id: Optional[str] = None
+        # Graph distance to the current objective at the previous decision,
+        # used for potential-based progress shaping.
+        self.prev_objective_distance: Optional[float] = None
         self.death_position: Optional[np.ndarray] = None
 
         self._setup_agent_model()
@@ -179,6 +182,7 @@ class Agent:
         self.movement_speed = AGENT_MOVEMENT_SPEED
         self.pending_reward = 0.0
         self.last_attacker_id = None
+        self.prev_objective_distance = None
         self.prev_position = None
         self.prev_decision_tick = None
         self.current_direction = None
