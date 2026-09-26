@@ -5,7 +5,7 @@ from tqdm import tqdm
 import argparse
 
 # Import the _process_single_file function from dataset.py
-from dataset import DamageOutcomeDataset
+from .dataset import DamageOutcomeDataset
 
 def extract_positive_samples(data_dir, output_file):
     """Extract all positive samples from the dataset and save to a file.

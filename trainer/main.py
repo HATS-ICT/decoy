@@ -4,10 +4,10 @@ import torch
 import matplotlib.pyplot as plt
 import random
 import numpy as np
-from dataset import DamageOutcomeDataset
-from model import DamageOutcomeModel
-from trainer import Trainer
-from utils import create_run_dir
+from .dataset import DamageOutcomeDataset
+from .model import DamageOutcomeModel
+from .trainer import Trainer
+from .utils import create_run_dir
 import argparse
 
 

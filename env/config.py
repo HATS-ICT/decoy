@@ -1,4 +1,20 @@
-from panda3d.core import BitMask32
+import os
+from pathlib import Path
+
+from panda3d.core import BitMask32, Filename
+
+# --- Path anchoring -----------------------------------------------------------
+# All asset paths are resolved relative to this file, not the current working
+# directory, so the package works no matter where the interpreter was started.
+PACKAGE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_DIR.parent
+ASSETS_DIR = PACKAGE_DIR / "assets"
+
+
+def panda_path(path) -> Filename:
+    """Convert an OS path into the Panda3D-native Filename form its loaders expect."""
+    return Filename.fromOsSpecific(str(path))
+
 
 # # Camera settings
 # INITIAL_CAMERA_POS = (4.7, -16.2, 13.1)
@@ -18,8 +34,8 @@ GRAVITY = -9.81
 NO_MODEL_CACHE = False
 
 # Map settings
-MAP_PATH = "env/assets/de_dust_2.fbx"
-WAYPOINT_DATA_PATH = "env/assets/WaypointDust2Verified_p3d_clean_verified.json"
+MAP_PATH = str(ASSETS_DIR / "de_dust_2.fbx")
+WAYPOINT_DATA_PATH = str(ASSETS_DIR / "WaypointDust2Verified_p3d_clean_verified.json")
 MAP_POSITION = (0, 0, 3)
 # MAP_SCALE = 0.00017
 COORDINATE_SCALE = 0.01905
@@ -33,7 +49,7 @@ DIRECTIONAL_LIGHT_ROT = (60, -54, 0)
 AMBIENT_LIGHT_COLOR = (0.2, 0.2, 0.2, 1)
 
 # Agent settings
-AGENT_MODEL_PATH = "env/assets/agent.glb"
+AGENT_MODEL_PATH = str(ASSETS_DIR / "agent.glb")
 AGENT_SCALE = 0.6
 AGENT_HITBOX_RADIUS = 0.13
 AGENT_HITBOX_HEIGHT = 1.3
@@ -41,6 +57,11 @@ AGENT_HITBOX_MARGIN = 0.05
 AGENT_MAX_HEALTH = 100
 AGENT_MOVEMENT_SPEED = 4.7625  # holding knife speed = 250 hammer units / sec = 4.7625 m/s
 ENABLE_AGENT_SHOOTING = True
+# When False (the default, and the behaviour the published results were produced
+# with) every agent's view angle is pinned at a constant 90 degrees. When True,
+# agents face along their movement heading, which gives the damage model's
+# relative-angle feature real signal. See Agent.view_angle.
+AGENT_VIEW_ANGLE_FOLLOWS_MOVEMENT = False
 ENABLE_BOMB_ACTIONS = True  
 TARGET_REACH_DISTANCE_THRESHOLD = AGENT_HITBOX_RADIUS
 TARGET_REACH_DISTANCE_THRESHOLD_HEIGHT = 0.15
@@ -68,7 +89,7 @@ GAME_TIME_BOMB_EXTENSION = 40 # seconds
 BOMB_NEAR_DISTANCE_THRESHOLD = 2
 STOP_ACTION_INDEX = 8
 ENABLE_LOGGING = True
-LOG_FOLDER = "logs_damage"
+LOG_FOLDER = os.environ.get("DECOY_LOG_FOLDER", str(PROJECT_ROOT / "logs_damage"))
 LOG_FREQUENCY = 1/4 # twice per second
 DAMAGE_MODEL_FREQUENCY = 1/2 # once per second
 
@@ -84,15 +105,15 @@ DEBUG_ARROW_SIZE = 0.2
 DEBUG_AGENT_PATH_COLOR = (1, 0, 0, 1)  # Red
 DEBUG_AGENT_PATH_THICKNESS = 3.0
 DEBUG_HITBOX_COLOR = (1, 1, 0, 1)  # Yellow
-MINIMAP_IMAGE_PATH = "env/assets/de_dust2.png"
+MINIMAP_IMAGE_PATH = str(ASSETS_DIR / "de_dust2.png")
 MINIMAP_RATIO = 0.4
 MINIMAP_DOT_SIZE = 0.02
-MINIMAP_DOT_TEXTURE_PATH = "env/assets/white_dot.png"
+MINIMAP_DOT_TEXTURE_PATH = str(ASSETS_DIR / "white_dot.png")
 SHOW_TRACE = False
 
 # NN Model Settings
-DAMAGE_INDICATOR_PREDICTOR_MODEL_PATH = "models/train-di_20250328-183510_y5vpxd"
-DAMAGE_OUTCOME_GENERATOR_MODEL_PATH = "models/train-vae_20250321-040316_upf4hz"
+DAMAGE_INDICATOR_PREDICTOR_MODEL_PATH = str(PROJECT_ROOT / "models" / "train-di_20250328-183510_y5vpxd")
+DAMAGE_OUTCOME_GENERATOR_MODEL_PATH = str(PROJECT_ROOT / "models" / "train-vae_20250321-040316_upf4hz")
 
 # Spectator Mode Settings
 SPECTATOR_BASE_SPEED = 10.0

@@ -1,11 +1,11 @@
-from csgo_environment import env
+from .csgo_environment import env
 import numpy as np
-from policy import ReplayPolicy
+from .policy import ReplayPolicy
 import os
-from utils import transform_csgo_to_panda3d
+from .utils import transform_csgo_to_panda3d
 from tqdm import tqdm 
 from multiprocessing import Pool
-from utils import Weapon
+from .utils import Weapon
 import signal
 
 def should_trigger_timeout(player_policies, replay_env):

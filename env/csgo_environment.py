@@ -1,34 +1,80 @@
-import time
+"""PettingZoo AEC environment wrapping the DECOY CS:GO simulation.
+
+Agents act asynchronously: the simulation runs until an agent reaches its target
+waypoint and requests a decision, so ``agent_selection`` follows the engine's
+decision queue rather than a fixed turn order. That is a legitimate AEC
+ordering, but it means the reward and termination bookkeeping has to be driven
+from the engine on every step, which is what :meth:`raw_env._sync_from_engine`
+does.
+"""
+
 import functools
+from typing import Dict, List, Optional
 
 from gymnasium.spaces import Discrete, Box
 import numpy as np
 
 from pettingzoo import AECEnv
 from pettingzoo.utils import wrappers
-from panda3d.core import Vec3
 
 from .game_engine import CSGOEngine
-from .config import COORDINATE_SCALE
+from .rewards import RewardConfig
+from .config import AGENT_MAX_HEALTH
+from .utils import BombStatus
+
+#: Movement directions plus the explicit "stop" action.
+NUM_ACTIONS = 9
 
 
-def env(num_team_agents=5, render_mode=None, debug_mode=False, show_waypoints=False, show_minimap=False):
+def observation_size(num_team_agents: int) -> int:
+    """Length of the flat observation vector for a given roster size.
+
+    Layout, in order::
+
+        own position            3
+        own health              1
+        bomb position           3
+        bomb status one-hot     len(BombStatus)
+        teammate positions      3 * (num_team_agents - 1)
+        teammate healths        1 * (num_team_agents - 1)
+
+    The environment used to advertise a fixed ``shape=(3,)`` regardless of this,
+    so anything sizing a network or a replay buffer from the declared space got
+    it wrong for every roster size.
     """
-    The env function often wraps the environment in wrappers by default.
-    You can find full documentation for these methods
-    elsewhere in the developer documentation.
-    """
-    env = raw_env(num_team_agents, render_mode=render_mode, debug_mode=debug_mode, 
-                  show_waypoints=show_waypoints, show_minimap=show_minimap)
-    env = wrappers.AssertOutOfBoundsWrapper(env)
-    return env
+    if num_team_agents < 1:
+        raise ValueError(f"num_team_agents must be >= 1, got {num_team_agents}")
+    teammates = num_team_agents - 1
+    return 3 + 1 + 3 + len(BombStatus) + 3 * teammates + teammates
+
+
+def env(num_team_agents=5, render_mode=None, debug_mode=False, show_waypoints=False,
+        show_minimap=False, reward_config: Optional[RewardConfig] = None,
+        seed: Optional[int] = None):
+    """Construct the environment behind the standard PettingZoo wrapper stack."""
+    environment = raw_env(
+        num_team_agents, render_mode=render_mode, debug_mode=debug_mode,
+        show_waypoints=show_waypoints, show_minimap=show_minimap,
+        reward_config=reward_config, seed=seed,
+    )
+    environment = wrappers.AssertOutOfBoundsWrapper(environment)
+    environment = wrappers.OrderEnforcingWrapper(environment)
+    return environment
 
 
 class raw_env(AECEnv):
-    metadata = {"render_modes": ["human"], "name": "csgo"}
+    metadata = {
+        "render_modes": ["spectator"],
+        "name": "decoy_csgo_v1",
+        "is_parallelizable": False,
+    }
 
-    def __init__(self, num_team_agents, render_mode=None, debug_mode=False, show_waypoints=False, show_minimap=False):
+    def __init__(self, num_team_agents, render_mode=None, debug_mode=False,
+                 show_waypoints=False, show_minimap=False,
+                 reward_config: Optional[RewardConfig] = None,
+                 seed: Optional[int] = None):
         super().__init__()
+        self.num_team_agents = num_team_agents
         self.possible_agents = [f"{team}_{i}" for team in ["T", "CT"] for i in range(num_team_agents)]
         self.agents = self.possible_agents[:]
         self.agent_name_mapping = dict(
@@ -36,215 +82,210 @@ class raw_env(AECEnv):
         )
 
         self.render_mode = render_mode
-        self.engine = CSGOEngine(num_team_agents, render_mode=render_mode, debug_mode=debug_mode,
-                                show_waypoints=show_waypoints, show_minimap=show_minimap)
+        self._observation_size = observation_size(num_team_agents)
+        self._action_space = Discrete(NUM_ACTIONS)
 
-        self.state_sequence = {
+        self.engine = CSGOEngine(
+            num_team_agents, render_mode=render_mode, debug_mode=debug_mode,
+            show_waypoints=show_waypoints, show_minimap=show_minimap,
+            reward_config=reward_config, seed=seed,
+        )
+        self._observation_space = self._build_observation_space()
+
+        self.rewards = {agent: 0.0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0.0 for agent in self.agents}
+        self.terminations = {agent: False for agent in self.agents}
+        self.truncations = {agent: False for agent in self.agents}
+        self.infos = {agent: {} for agent in self.agents}
+        self.agent_selection = None
+        self.state_sequence = self._empty_state_sequence()
+
+    # ------------------------------------------------------------------ spaces
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent):
+        return self._observation_space
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent):
+        return self._action_space
+
+    def _build_observation_space(self) -> Box:
+        """Per-dimension bounds, derived from the loaded map rather than +/-inf.
+
+        Position components are bounded by the waypoint graph's bounding box
+        (with a margin for the spawn height offset and for agents drifting off a
+        waypoint between decisions), healths by [0, AGENT_MAX_HEALTH] and the
+        bomb-status one-hot by [0, 1].
+        """
+        lo_xyz, hi_xyz = self.engine.waypoints.position_bounds()
+        margin = 5.0
+        lo_xyz = lo_xyz - margin
+        hi_xyz = hi_xyz + margin
+        max_hp = float(AGENT_MAX_HEALTH)
+
+        low, high = [], []
+
+        def add(lows, highs):
+            low.extend(lows)
+            high.extend(highs)
+
+        add(lo_xyz, hi_xyz)                              # own position
+        add([0.0], [max_hp])                             # own health
+        add(lo_xyz, hi_xyz)                              # bomb position
+        add([0.0] * len(BombStatus), [1.0] * len(BombStatus))
+        for _ in range(self.num_team_agents - 1):        # teammate positions
+            add(lo_xyz, hi_xyz)
+        for _ in range(self.num_team_agents - 1):        # teammate healths
+            add([0.0], [max_hp])
+
+        assert len(low) == self._observation_size, (
+            f"observation bounds ({len(low)}) disagree with observation_size "
+            f"({self._observation_size})"
+        )
+        return Box(
+            low=np.array(low, dtype=np.float32),
+            high=np.array(high, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _empty_state_sequence(self):
+        return {
             agent: {
                 "observation": [],
                 "reward": [],
                 "termination": [],
                 "truncation": [],
-                "episode_length": 0
+                "episode_length": 0,
             }
-            for agent in self.agents
+            for agent in self.possible_agents
         }
 
-    @functools.lru_cache(maxsize=None)
-    def observation_space(self, agent):
-        # Increased to 6 dimensions to include target position (x,y,z, target_x, target_y, target_z)
-        return Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
+    def _sync_from_engine(self) -> None:
+        """Pull rewards, termination flags and action masks out of the engine.
 
-    @functools.lru_cache(maxsize=None)
-    def action_space(self, agent):
-        return Discrete(9)
-    
+        Rewards are *drained*: each call returns what accrued since the previous
+        one, which is exactly the AEC notion of "reward since this agent last
+        acted" once ``_accumulate_rewards`` folds it into ``_cumulative_rewards``.
+        """
+        drained = self.engine.collect_rewards()
+        for agent in self.agents:
+            engine_agent = self.engine.agents[agent]
+            self.rewards[agent] = float(drained.get(agent, 0.0))
+            self.terminations[agent] = bool(engine_agent.termination)
+            self.truncations[agent] = False
+            self.infos[agent] = {"action_mask": engine_agent.action_mask}
+
+    def _select_next_agent(self) -> Optional[str]:
+        """Next agent to act, taken from the engine queue.
+
+        Skips agents that have already been retired, since a dead agent can
+        still be sitting in the decision queue from before it died.
+        """
+        while True:
+            candidate = self.engine.get_next_agent()
+            if candidate is None:
+                break
+            if candidate in self.agents:
+                return candidate
+
+        # Queue drained. Any agent still flagged terminated has not been
+        # retired yet and must be handed back so the caller can step it once
+        # with None.
+        pending = [a for a in self.agents if self.terminations[a] or self.truncations[a]]
+        if pending:
+            return pending[0]
+        return self.agents[0] if self.agents else None
+
+    def _retire_agent(self, agent: str) -> None:
+        """Remove a terminated agent, mirroring ``AECEnv._was_dead_step``.
+
+        Upstream's helper also picks the next ``agent_selection`` from its own
+        ordering, which would fight the engine's decision queue, so the removal
+        bookkeeping is done here and selection stays with the engine.
+        """
+        del self.terminations[agent]
+        del self.truncations[agent]
+        del self.rewards[agent]
+        del self._cumulative_rewards[agent]
+        del self.infos[agent]
+        self.agents.remove(agent)
+
+    # ------------------------------------------------------------------ API
     def observe(self, agent):
-        observation, reward, termination, truncation, info = self.engine.get_agent_state(agent)
-        self.rewards[agent] = reward
-        self.terminations[agent] = termination
-        self.truncations[agent] = truncation
-        self.infos[agent]["action_mask"] = info["action_mask"]
-        return observation
-    
+        """Return the observation for ``agent``.
+
+        Pure: reward and termination state are maintained by ``step`` and
+        ``reset`` rather than being written as a side effect of observing.
+        """
+        return self.engine.agents[agent].observation
+
     def reset(self, seed=None, options=None):
-        """
-        Reset needs to initialize the following attributes
-        - agents
-        - rewards
-        - terminations
-        - truncations
-        - infos
-        - agent_selection
-        And must set up the environment so that render(), step(), and observe()
-        can be called without issues.
-        Here it sets up the state dictionary which is used by step() and the observations dictionary which is used by step() and observe()
-        """
+        if seed is not None:
+            self.engine.seed(seed)
+
         self.agents = self.possible_agents[:]
-        self.rewards = {agent: 0 for agent in self.agents}
-        self._cumulative_rewards = {agent: 0 for agent in self.agents}
+        self.rewards = {agent: 0.0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0.0 for agent in self.agents}
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
 
         self.engine.reset(options)
-        self.agent_selection = self.engine.get_next_agent()
-
-        self.state_sequence = {
-            agent: {
-                "observation": [],
-                "reward": [],
-                "termination": [],
-                "truncation": [],
-                "episode_length": 0
-            }
-            for agent in self.agents
-        }
+        self._sync_from_engine()
+        self.agent_selection = self._select_next_agent()
+        self.state_sequence = self._empty_state_sequence()
 
     def step(self, action):
-        """
-        step(action) takes in an action for the current agent (specified by
-        agent_selection) and needs to update
-        - rewards
-        - _cumulative_rewards (accumulating the rewards)
-        - terminations
-        - truncations
-        - infos
-        - agent_selection (to the next agent)
-        And any internal state used by observe() or render()
+        """Advance the simulation by one agent decision.
+
+        A terminated agent is stepped once with ``None`` and then retired, which
+        is what lets ``agent_iter`` end: it stops when ``self.agents`` is empty.
         """
         agent = self.agent_selection
+        if agent is None:
+            return
 
-        # the agent which stepped last had its _cumulative_rewards accounted for
-        # (because it was returned by last()), so the _cumulative_rewards for this
-        # agent should start again at 0
-        self._cumulative_rewards[agent] = 0
+        if self.terminations[agent] or self.truncations[agent]:
+            if action is not None:
+                raise ValueError(
+                    f"{agent} has terminated; the only valid action is None, got {action!r}"
+                )
+            self._retire_agent(agent)
+            self._clear_rewards()
+            self.agent_selection = self._select_next_agent()
+            return
 
-        if action is not None:
-            self.engine.set_move_target(agent, action)
-            self.engine.update_simulation() # result is either game ended or until next agent decision request
+        # The agent's accumulated reward was handed to the caller by last(), so
+        # it starts over from here.
+        self._cumulative_rewards[agent] = 0.0
 
-        self.agent_selection = self.engine.get_next_agent()
+        self.engine.set_move_target(agent, action)
+        self.engine.update_simulation()
+
+        self._sync_from_engine()
+        self._accumulate_rewards()
+        self.agent_selection = self._select_next_agent()
+
+    def render(self):
+        if self.render_mode is None:
+            return
+        # Rendering is driven by the engine's own frame pacing inside
+        # update_simulation(); there is no separate frame to emit here.
+        return None
 
     def close(self):
         self.engine.destroy()
 
-def transform_csgo_to_panda3d(x, y, z, return_vec3=False):
-    """
-    Transforms a point from replay data space directly to Panda3D space.
-    
-    The transformation pipeline is as follows:
-      1. The replay data point is first interpreted as (x, y, -z)
-         (this is how the JSON data is loaded into Unity).
-      2. It is then scaled by a uniform factor.
-      3. A rotation given by Euler angles (90°, 270°, 90°) is applied.
-      4. A translation is added.
-      5. Finally, the Unity coordinate is converted to Panda3D space via:
-            Panda3D_x = -Unity_x,
-            Panda3D_y = -Unity_z,
-            Panda3D_z =  Unity_y.
-    
-    Parameters:
-        x, y, z (float): The coordinates from the replay JSON file.
-    
-    Returns:
-        np.array: The transformed (x, y, z) coordinate in Panda3D space.
-    """
-    # --- Step 1: Convert replay data to initial Unity coordinate ---
-    # In the replay code, the data is loaded as:
-    #     Vector3(position[0], position[1], -position[2])
-    point = np.array([x, y, z])
-    
-    # --- Step 2: Apply scaling ---
-    # Unity scaling factor from the GameReplayManager (0.017 on each axis)
-    # scaling = np.array([0.017, 0.017, 0.017])
-    scaling = np.array([COORDINATE_SCALE, COORDINATE_SCALE, COORDINATE_SCALE])
-    point = point * scaling
-    translation = np.array([0.0, 0.0, 3.1])
-    point = point + translation
+    # ------------------------------------------------------------------ extras
+    @property
+    def reward_config(self) -> RewardConfig:
+        return self.engine.reward_config
 
-    if return_vec3:
-        return Vec3(point[0], point[1], point[2])
-    else:
-        return point
-    
+    def agent_stats(self) -> Dict[str, dict]:
+        """Per-agent episode statistics (kills, damage, distance travelled)."""
+        return {aid: a.stats.to_dict() for aid, a in self.engine.agents.items()}
 
-def get_a_panda3d_position_sequence(file_idx=10):
-    REPLAY_DATA_FOLDER = os.path.join("data", "player_seq_allmap_de_dust2_npz")
-    replay_data_files = [f for f in os.listdir(REPLAY_DATA_FOLDER) if f.endswith(".npz")]
-    data_file = replay_data_files[file_idx]
-    replay_data = np.load(os.path.join(REPLAY_DATA_FOLDER, data_file))
-    all_player_positions = replay_data["player_trajectory"]
-    return transform_csgo_to_panda3d(all_player_positions)
-    
-
-if __name__ == "__main__":
-    my_env = env(num_team_agents=2, render_mode="spectator", debug_mode=True, show_waypoints=False, show_minimap=True)
-    # my_env = env(num_team_agents=2, render_mode=None, debug_mode=False)
-    my_env.reset()
-    step_count = 0
-    start_time = time.time()
-    last_print_time = start_time
-
-    # panda3d_positions = get_a_panda3d_position_sequence(file_idx=10)
-    # for positions in panda3d_positions:
-    #     my_env.env.engine.debug_manager.draw_connected_debug_lines(positions, color=(1, 0, 0, 1), thickness=3.0)
-    
-    MAX_STEPS = 10000
-    for agent in my_env.agent_iter():
-        observation, reward, termination, truncation, info = my_env.last()
-
-        my_env.state_sequence[agent]["observation"].append(observation)
-        my_env.state_sequence[agent]["reward"].append(reward)
-        my_env.state_sequence[agent]["termination"].append(termination)
-        my_env.state_sequence[agent]["truncation"].append(truncation)
-        my_env.state_sequence[agent]["episode_length"] += 1
-        # for agent in my_env.possible_agents:
-        #     print(f"Agent {agent} episode length: {my_env.state_sequence[agent]['episode_length']}")
-
-        if all(my_env.terminations.values()) or all(my_env.truncations.values()):
-            time1 = time.time()
-            # my_env.reset(options=test_spawn)
-            my_env.reset()
-            continue
-
-        if termination or truncation:
-            action = None
-        else:
-            action_mask = info["action_mask"]
-            valid_actions = np.where(action_mask)[0]
-            action = np.random.choice(valid_actions)
-
-        my_env.step(action)
-        step_count += 1
-
-        if step_count > MAX_STEPS:
-            print("Max steps reached")
-            break
-    
-    my_env.close()
-
-
-# if __name__ == "__main__":
-#     my_env = env(num_team_agents=10, render_mode="spectator", debug_mode=True)
-#     my_env.reset()
-#     step_count = 0
-#     start_time = time.time()
-#     last_print_time = start_time
-#     agent_actions = {agent: True for agent in my_env.possible_agents}  # Track each agent's action state
-    
-#     for agent in my_env.agent_iter():
-#         print(my_env.engine.agent_action_request_queue)
-#         observation, reward, termination, truncation, info = my_env.last()
-#         # print(f"Agent {agent} observation: {observation}")
-        
-#         if termination or truncation:
-#             action = None
-#         else:
-#             action = 0 if agent_actions[agent] else 2
-#             agent_actions[agent] = not agent_actions[agent]  # Toggle this agent's next action
-            
-#         my_env.step(action)
-#         step_count += 1
-    
-#     my_env.close()
+    def round_outcome(self):
+        """``(winning_team, win_reason)`` for the finished round, or ``(None, None)``."""
+        return self.engine.winning_team, self.engine.winning_reason

@@ -1,7 +1,7 @@
 from panda3d.core import Vec3, LineSegs, TextNode, TextProperties, TextPropertiesManager, CardMaker, TransparencyAttrib
 from direct.gui.OnscreenText import OnscreenText
 from .config import *
-from .utils import tramsform_to_minimap
+from .utils import transform_to_minimap
 
 class DebugManager:
     def __init__(self, engine):
@@ -164,7 +164,7 @@ class DebugManager:
         top_edge_y = 1  # Topmost position in aspect2d (always 1)
 
         self.minimap_np.setPos(right_edge_x - MINIMAP_RATIO, 0, top_edge_y - MINIMAP_RATIO)
-        minimap_texture = self.engine.loader.loadTexture(MINIMAP_IMAGE_PATH)
+        minimap_texture = self.engine.loader.loadTexture(panda_path(MINIMAP_IMAGE_PATH))
         self.minimap_image_size = minimap_texture.getXSize()
         self.minimap_np.setTexture(minimap_texture)
 
@@ -190,13 +190,13 @@ class DebugManager:
     
     def add_minimap_dot(self, world_pos, color):
         """Adds a dot for a player based on transformed coordinates"""
-        x, y = tramsform_to_minimap(world_pos, self.minimap_image_size)
+        x, y = transform_to_minimap(world_pos, self.minimap_image_size)
 
         cm = CardMaker("dot")
         cm.setFrame(-MINIMAP_DOT_SIZE, MINIMAP_DOT_SIZE, -MINIMAP_DOT_SIZE, MINIMAP_DOT_SIZE)  # Small square dot
 
         dot_np = self.minimap_np.attachNewNode(cm.generate())
-        dot_texture = self.engine.loader.loadTexture(MINIMAP_DOT_TEXTURE_PATH)
+        dot_texture = self.engine.loader.loadTexture(panda_path(MINIMAP_DOT_TEXTURE_PATH))
         dot_np.setTexture(dot_texture)
         dot_np.setTransparency(TransparencyAttrib.M_alpha)
         dot_np.setPos(x, 0, y)

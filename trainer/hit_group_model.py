@@ -2,16 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from dataset import DamageOutcomeDataset, collate_fn
+from .dataset import DamageOutcomeDataset, collate_fn
 from torch.utils.data import DataLoader
 import torch.optim as optim
 from tqdm import tqdm
 import os
 import argparse
-from utils import create_run_dir, calculate_multiclass_classification_metrics, plot_confusion_matrix, plot_class_metrics
+from .utils import create_run_dir, calculate_multiclass_classification_metrics, plot_confusion_matrix, plot_class_metrics
 import matplotlib.pyplot as plt
-import wandb
-from dataset import HIT_GROUP_NAMES
+from ._wandb import wandb
+from .dataset import HIT_GROUP_NAMES
 
 
 class HitGroupClassificationModel(nn.Module):

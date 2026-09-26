@@ -1,4 +1,6 @@
 import networkx as nx
+import numpy as np
+from scipy.spatial import cKDTree
 from panda3d.core import Vec3
 import json
 from collections import defaultdict
@@ -817,6 +819,11 @@ class WaypointGraph:
         self.regions = defaultdict(list)
         self.region2id = {}
         self.id2region = {}
+        # Spatial index over waypoint positions, built lazily and invalidated
+        # whenever the node set changes. Nearest-waypoint lookup used to be a
+        # linear scan over ~6.6k nodes, which dominated replay processing.
+        self._kdtree = None
+        self._kdtree_ids = None
         
     def load_from_json(self, json_path):
         """Load waypoints from JSON file and construct the graph."""
@@ -870,6 +877,7 @@ class WaypointGraph:
 
     def add_waypoint(self, waypoint_id, x, y, z, grid_x, grid_y, is_cover_point, region_type):
         """Add a new waypoint to the graph."""
+        self._invalidate_spatial_index()
         self.graph.add_node(waypoint_id, 
                             id=waypoint_id, 
                             pos=Vec3(x, y, z), 
@@ -890,6 +898,7 @@ class WaypointGraph:
 
     def remove_waypoint(self, waypoint_id):
         """Remove a waypoint from the graph and all connections associated with it."""
+        self._invalidate_spatial_index()
         # Remove waypoint from regions if it exists
         region_type = self.graph.nodes[waypoint_id].get('region_type')
         if region_type and region_type in self.regions:
@@ -926,6 +935,73 @@ class WaypointGraph:
         if direction_to_remove is not None:
             del from_node['neighbor_ids'][direction_to_remove]
         self.graph.remove_edge(from_id, to_id)
+
+    def _invalidate_spatial_index(self):
+        self._kdtree = None
+        self._kdtree_ids = None
+
+    def _ensure_spatial_index(self):
+        """Build the KD-tree over waypoint positions if it is not current."""
+        if self._kdtree is not None:
+            return
+        ids = list(self.graph.nodes)
+        if not ids:
+            raise ValueError("Waypoint graph is empty; load a waypoint file first")
+        positions = np.array(
+            [[p.x, p.y, p.z] for p in (self.graph.nodes[i]["pos"] for i in ids)],
+            dtype=np.float64,
+        )
+        self._kdtree_ids = ids
+        self._kdtree = cKDTree(positions)
+
+    def distance_field(self, target_ids):
+        """Graph distance from every waypoint to the nearest of ``target_ids``.
+
+        Edge weights are euclidean segment lengths, so the result is true
+        traversal distance and respects walls -- unlike straight-line distance,
+        which on a map like de_dust2 points agents through geometry they cannot
+        walk through.
+
+        Implemented as one multi-source Dijkstra on the reversed graph, which
+        gives distances *to* the targets rather than *from* them. One pass over
+        the full 6.6k-node graph takes a few milliseconds, so this is cheap
+        enough to recompute whenever the objective moves.
+
+        Returns:
+            dict mapping waypoint id -> distance. Unreachable nodes are absent.
+        """
+        targets = [t for t in target_ids if t in self.graph]
+        if not targets:
+            raise ValueError("distance_field called with no valid target waypoints")
+
+        if not self.graph.has_edge(*next(iter(self.graph.edges))) or "weight" not in \
+                self.graph.edges[next(iter(self.graph.edges))]:
+            self._ensure_edge_weights()
+
+        reverse = self.graph.reverse(copy=False)
+        return nx.multi_source_dijkstra_path_length(reverse, set(targets), weight="weight")
+
+    def _ensure_edge_weights(self):
+        """Annotate every edge with its euclidean length, once."""
+        for u, v, data in self.graph.edges(data=True):
+            if "weight" not in data:
+                data["weight"] = float(vec_distance(
+                    self.graph.nodes[u]["pos"], self.graph.nodes[v]["pos"]
+                ))
+
+    def waypoints_in_region(self, region_type: Region):
+        """All waypoint ids belonging to ``region_type``."""
+        return list(self.regions[region_type])
+
+    def position_bounds(self):
+        """Axis-aligned bounding box over all waypoints, as (min_xyz, max_xyz)."""
+        self._ensure_spatial_index()
+        data = self._kdtree.data
+        return data.min(axis=0), data.max(axis=0)
+
+    def get_position(self, node_id):
+        """Position of a waypoint, as a Vec3."""
+        return self.graph.nodes[node_id]["pos"]
 
     def get_waypoint_by_id(self, node_id, return_pos=False):
         """Get the waypoint by its ID."""
@@ -965,33 +1041,33 @@ class WaypointGraph:
         return neighbor_waypoint
     
     def get_nearest_waypoint(self, position, return_id=False, return_pos=False):
-        """Find the closest waypoint to a given position."""
-        assert not (return_id and return_pos), "Cannot return both ID and position"
+        """Find the closest waypoint to a given position.
 
-        min_distance = float('inf')
-        nearest_id = None
-        
-        for node_id, attr in self.graph.nodes(data=True):
-            if not attr:  # This shouldn't happen if nodes were added correctly
-                print(f"Warning: Node {node_id} has no attributes!")
-                continue
-            waypoint_pos = attr['pos']
-            distance = vec_distance(position, waypoint_pos)
-            
-            if distance < min_distance:
-                min_distance = distance
-                nearest_id = node_id
-        
+        Backed by a KD-tree rather than a linear scan over every node, which
+        matters because replay processing calls this twice per sampled position.
+        """
+        assert not (return_id and return_pos), "Cannot return both ID and position"
+        self._ensure_spatial_index()
+
+        query = np.asarray([position[0], position[1], position[2]], dtype=np.float64)
+        _distance, index = self._kdtree.query(query)
+        nearest_id = self._kdtree_ids[int(index)]
+
         if return_id:
             return nearest_id
         elif return_pos:
             return self.get_position(nearest_id)
         return self.graph.nodes[nearest_id]
     
-    def get_random_waypoint(self, return_id=False, return_pos=False):
-        """Get a random waypoint from the graph."""
+    def get_random_waypoint(self, return_id=False, return_pos=False, rng=None):
+        """Get a random waypoint from the graph.
+
+        ``rng`` accepts a ``random.Random`` so the caller can make spawn
+        selection reproducible; it falls back to the global module RNG.
+        """
         assert not (return_id and return_pos), "Cannot return both ID and position"
-        waypoint_id = random.choice(list(self.graph.nodes))
+        chooser = rng if rng is not None else random
+        waypoint_id = chooser.choice(list(self.graph.nodes))
         waypoint = self.graph.nodes[waypoint_id]
         if return_id:
             return waypoint_id
@@ -999,10 +1075,14 @@ class WaypointGraph:
             return waypoint['pos']
         return waypoint
     
-    def get_random_waypoint_in_region(self, region_type: Region, return_id=False, return_pos=False):
+    def get_random_waypoint_in_region(self, region_type: Region, return_id=False, return_pos=False, rng=None):
         """Get a random waypoint in a specific region."""
         assert not (return_id and return_pos), "Cannot return both ID and position"
-        waypoint_id = random.choice(self.regions[region_type])
+        chooser = rng if rng is not None else random
+        candidates = self.regions[region_type]
+        if not candidates:
+            raise ValueError(f"No waypoints registered for region {region_type}")
+        waypoint_id = chooser.choice(candidates)
         waypoint = self.graph.nodes[waypoint_id]
         if return_id:
             return waypoint_id
@@ -1040,8 +1120,6 @@ class WaypointGraph:
                 start_id = full_path[i-1]
                 end_id = full_path[i]
                 action = STOP_ACTION_INDEX if start_id == end_id else self.graph.edges[start_id, end_id]['direction'].value
-                if start_id != end_id:
-                    direction = self.graph.edges[start_id, end_id]['direction']
                 full_actions.append(action)
         return full_path, full_actions
 

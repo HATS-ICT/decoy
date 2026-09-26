@@ -99,7 +99,7 @@ class DamageEstimateModel:
         ).to(self.device)
         
         # Load weights
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         self.indicator_model.load_state_dict(checkpoint['model_state_dict'])
         self.indicator_model.eval()
         
@@ -136,7 +136,7 @@ class DamageEstimateModel:
         ).to(self.device)
         
         # Load weights
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         self.generator_model.load_state_dict(checkpoint['model_state_dict'])
         self.generator_model.eval()
     
@@ -203,6 +203,113 @@ class DamageEstimateModel:
         
         return True, damage_amount, hit_group
     
+
+    # ------------------------------------------------------------------ batch
+    def predict_damage_batch(self, engagements: List[Dict]) -> List[Tuple[bool, Optional[float], Optional[int]]]:
+        """Resolve many attacker/victim pairs in one pair of forward passes.
+
+        The per-pair path built roughly six small tensors, moved each of them to
+        the device separately and ran a batch of one, twice, for every ordered
+        pair of opposing agents on every damage tick. At 5v5 that is up to 50
+        such round trips per tick. Batching collapses them into two forward
+        passes without changing the result: both models are in ``eval()`` mode,
+        so batch norm uses running statistics and rows do not interact.
+
+        Args:
+            engagements: one dict per pair, with the same keys
+                :meth:`predict_damage` takes as arguments.
+
+        Returns:
+            One ``(will_damage, damage_amount, hit_group)`` tuple per input,
+            in the order given.
+        """
+        if self.indicator_model is None or self.generator_model is None:
+            raise ValueError("Models not loaded. Call load_model() first.")
+        if not engagements:
+            return []
+
+        features = self._prepare_features_batch(engagements)
+
+        with torch.no_grad():
+            logits = self.indicator_model(features)
+            probs = torch.sigmoid(logits).reshape(-1)
+            will_damage = probs >= self.damage_indicator_threshold
+
+        results: List[Tuple[bool, Optional[float], Optional[int]]] = [
+            (False, None, None) for _ in engagements
+        ]
+
+        hit_indices = torch.nonzero(will_damage, as_tuple=False).reshape(-1)
+        if hit_indices.numel() == 0:
+            return results
+
+        # Only the rows that actually land are pushed through the generator.
+        hit_features = {k: v[hit_indices] for k, v in features.items()}
+        with torch.no_grad():
+            damage_values, hit_group_logits = self.generator_model.sample(hit_features, num_samples=1)
+            damage_amounts = damage_values.mean(dim=(1, 2)) * 100
+            hit_group_probs = F.softmax(hit_group_logits, dim=2).mean(dim=1)
+            hit_groups = hit_group_probs.argmax(dim=1)
+
+        for row, damage, group in zip(
+            hit_indices.tolist(), damage_amounts.tolist(), hit_groups.tolist()
+        ):
+            results[row] = (True, float(damage), int(group))
+        return results
+
+    def _prepare_features_batch(self, engagements: List[Dict]) -> Dict[str, torch.Tensor]:
+        """Vectorised counterpart of :meth:`_prepare_features`."""
+        n = len(engagements)
+
+        attacker_pos = np.array(
+            [np.asarray(transform_panda3d_to_csgo(e["attacker_pos"]), dtype=np.float64)
+             for e in engagements]
+        )
+        victim_pos = np.array(
+            [np.asarray(transform_panda3d_to_csgo(e["victim_pos"]), dtype=np.float64)
+             for e in engagements]
+        )
+        attacker_angle = np.array([float(e["attacker_angle"]) for e in engagements])
+        victim_angle = np.array([float(e["victim_angle"]) for e in engagements])
+        attacker_hp = np.array([float(e["attacker_hp"]) for e in engagements])
+
+        distance = np.linalg.norm(attacker_pos - victim_pos, axis=1)
+
+        delta = victim_pos - attacker_pos
+        attacker_view_rad = attacker_angle * np.pi / 180.0
+        vector_angle = np.arctan2(delta[:, 1], delta[:, 0])
+        relative_angle = np.remainder(vector_angle - attacker_view_rad + np.pi, 2 * np.pi) - np.pi
+        normalized_relative_angle = relative_angle / np.pi
+
+        coords_and_angles = np.column_stack([
+            attacker_pos,
+            attacker_angle / 360.0,
+            victim_pos,
+            victim_angle / 360.0,
+            attacker_hp / 100.0,
+            distance,
+            normalized_relative_angle,
+        ]).astype(np.float32)
+
+        weapon_onehot = np.zeros((n, self.num_weapons), dtype=np.float32)
+        weapon_onehot[np.arange(n), [int(e["attacker_weapon_id"]) for e in engagements]] = 1.0
+
+        armor_features = np.array(
+            [[float(e.get("victim_has_helmet", False)), float(e.get("victim_has_armor", False))]
+             for e in engagements],
+            dtype=np.float32,
+        )
+
+        map_features = np.zeros((n, self.num_maps), dtype=np.float32)
+        map_features[:, self.default_map_index] = 1.0
+
+        return {
+            "map": torch.from_numpy(map_features).to(self.device),
+            "coords_and_angles": torch.from_numpy(coords_and_angles).to(self.device),
+            "weapon": torch.from_numpy(weapon_onehot).to(self.device),
+            "armor_features": torch.from_numpy(armor_features).to(self.device),
+        }
+
     def _prepare_features(self, 
                           attacker_pos: np.ndarray,
                           victim_pos: np.ndarray, 

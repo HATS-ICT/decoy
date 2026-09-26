@@ -7,9 +7,9 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
-import wandb
-from dataset import collate_fn
-from utils import evaluate_predictions, log_metrics, plot_metrics
+from ._wandb import wandb
+from .dataset import collate_fn
+from .utils import evaluate_predictions, log_metrics, plot_metrics
 
 
 class Trainer:

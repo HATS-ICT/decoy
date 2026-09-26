@@ -1,5 +1,5 @@
 import numpy as np
-from config import STOP_ACTION_INDEX
+from .config import STOP_ACTION_INDEX
 
 
 class Policy:

@@ -115,3 +115,7 @@ celerybeat.pid
 Thumbs.db
 
 *.fbx
+# DECOY: simulation output, training runs and MARL checkpoints
+logs_damage/
+runs/
+marl_runs/
